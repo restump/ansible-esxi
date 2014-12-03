@@ -1,0 +1,16 @@
+- hosts: esxi-local
+  gather_facts: no
+  
+  tasks:
+    - name: 'Configure NTP Servers'
+      action: esx-datetime servers=0.pool.ntp.org,1.pool.ntp.org
+      notify:
+        - Restart NTP Service
+    - name: 'Enable NTP Service'
+      action: esx-service policy=on key=ntpd action=start
+    - name: 'Disable Shell Warnings'
+      action: esx-option key="UserVars.SuppressShellWarning" type=long value=1
+
+  handlers:
+    - name: 'Restart NTP Service'
+      action: esx-service key=ntpd action=restart

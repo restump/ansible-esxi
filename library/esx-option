@@ -1,0 +1,283 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+# (c) 2014, Reuben Stump <reuben.stump@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at 
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+module: esx-option
+author: Reuben Stump
+version_added: "1.7"
+short_description: Manage ESXi advanced options settings
+requirements: [ ]
+description:
+    - Manage ESXi advanced option settings
+options:
+    key:
+        required: true
+        description:
+            - Option setting key (name)
+    value:
+        required: true
+        description:
+            - Option setting value
+    type:
+        required: false
+        description:
+            - Option setting value type
+'''
+
+EXAMPLES = ''' '''
+
+from pyVim.connect import SmartConnect, Disconnect
+from pyVmomi import vim
+
+import os
+import sys
+import json
+import shlex
+import atexit
+
+class EsxAnsibleModule(object):
+    """
+    Simple class providing common Ansible module methods.  As ESXi's Python environment is
+    limited, this is meant to replace AnsibleModule but provide similar functionality
+    """
+    
+    def __init__(self, argument_spec):
+        self.argument_spec  = argument_spec
+        self.params = None
+        self.args   = None
+        (self.params, self.args) = self.load_params()
+        
+        self.check_required()
+        self.check_defaults()
+        self.check_typevals()
+        
+    def load_params(self):
+        args_file  = sys.argv[1]
+        args_data  = file(args_file).read()
+        params = { } 
+        args_list = shlex.split(args_data)
+        for arg in args_list:
+            try:
+                (k, v) = arg.split("=", 1)
+            except Exception, e:
+                self.fail_json(msg="this module requires key=value arguments (%s)" % (items))
+            if k in params:
+                self.fail_json(msg="duplicate parameter: %s (value=%s)" % (k, v))
+            params[k] = v
+        return (params, args_data)
+                
+    def fail_json(self, **kwargs):
+        assert 'msg' in kwargs, "implementation error -- msg to explain the error is required"
+        kwargs['failed'] = True
+        print json.dumps(kwargs)
+        sys.exit(1)
+                
+    def exit_json(self, **kwargs):
+        if not 'changed' in kwargs:
+            kwargs['changed'] = False
+        print json.dumps(kwargs)
+        sys.exit(0)       
+     
+    def boolean(self, arg):
+        ''' return a bool for the arg '''
+        if arg is None or type(arg) == bool:
+            return arg
+        if type(arg) in types.StringTypes:
+            arg = arg.lower()
+        if arg in BOOLEANS_TRUE:
+            return True
+        elif arg in BOOLEANS_FALSE:
+            return False
+        else:
+            self.fail_json(msg='Boolean %s not in either boolean list' % arg)
+                       
+    def check_required(self):
+        missing = []
+        for (k, v) in self.argument_spec.iteritems():
+            required = v.get('required', False)
+            if required and k not in self.params:
+                missing.append(k)
+            if len(missing) > 0:
+                self.fail_json(msg="missing required arguments: %s" % ",".join(missing))        
+          
+    def check_defaults(self):
+        for (k, v) in self.argument_spec.iteritems():
+            default = v.get('default', None)
+            if k not in self.params and not default == None:
+                self.params[k] = default              
+           
+    def check_typevals(self):
+        for (k, v) in self.argument_spec.iteritems():
+            choices = v.get('choices', None)
+            if choices is None:
+                continue
+            if type(choices) == list:
+                if k in self.params:
+                    if self.params[k] not in choices:
+                        choices_str=",".join([str(c) for c in choices])
+                        msg="value of %s must be one of: %s, got: %s" % (k, choices_str, self.params[k])
+                        self.fail_json(msg=msg)
+            else:
+                self.fail_json(msg="internal error: do not know how to interpret argument_spec")  
+        for (k, v) in self.argument_spec.iteritems():
+            wanted = v.get('type', None)
+            if wanted is None:
+                continue
+            if k not in self.params:
+                continue
+                
+            value = self.params[k]
+            is_invalid = False
+
+            if wanted   == 'str':
+                if not isinstance(value, basestring):
+                    self.params[k] = str(value)
+            elif wanted == 'list':
+                if not isinstance(value, list):
+                    if isinstance(value, basestring):
+                        self.params[k] = value.split(",")
+                    elif isinstance(value, int) or isinstance(value, float):
+                        self.params[k] = [ str(value) ]
+                    else:
+                        is_invalid = True
+            elif wanted == 'dict':
+                if not isinstance(value, dict):
+                    if isinstance(value, basestring):
+                        if value.startswith("{"):
+                            try:
+                                self.params[k] = json.loads(value)
+                            except:
+                                (result, exc) = self.safe_eval(value, dict(), include_exceptions=True)
+                                if exc is not None:
+                                    self.fail_json(msg="unable to evaluate dictionary for %s" % k)
+                                self.params[k] = result
+                        elif '=' in value:
+                                self.params[k] = dict([x.strip().split("=", 1) for x in value.split(",")])
+                        else:
+                            self.fail_json(msg="dictionary requested, could not parse JSON or key=value")
+                    else:
+                        is_invalid = True
+            elif wanted == 'bool':
+                if not isinstance(value, bool):
+                    if isinstance(value, basestring):
+                        self.params[k] = self.boolean(value)
+                    else:
+                        is_invalid = True
+            elif wanted == 'int':
+                if not isinstance(value, int):
+                    if isinstance(value, basestring):
+                        self.params[k] = int(value)
+                    else:
+                        is_invalid = True
+            elif wanted == 'float':
+                if not isinstance(value, float):
+                    if isinstance(value, basestring):
+                        self.params[k] = float(value)
+                    else:
+                        is_invalid = True
+            else:
+                self.fail_json(msg="implementation error: unknown type %s requested for %s" % (wanted, k))
+
+            if is_invalid:
+                self.fail_json(msg="argument %s is of invalid type: %s, required: %s" % (k, type(value), wanted))   
+    
+    def ha_host(self):
+        if not os.uname()[0] == 'VMkernel':
+            msg = "implementation error: target is not ESXi, expected %s not %s" % (os.uname()[0], 'VMkernel')
+            self.fail_json(msg=msg)
+        host = None
+        try:
+            si = SmartConnect(host='localhost', user='root')
+        except Exception as e:
+            self.fail_json(msg="SmartConnect exception: %s" % (e.message))
+        atexit.register(Disconnect, si)
+        content = si.content
+        host    = content.rootFolder.childEntity[0].hostFolder.childEntity[0].host[0]
+        return host
+        
+def main():
+    module = EsxAnsibleModule(
+        argument_spec = dict(
+            key     = dict(required=True, type='str'),
+            value   = dict(required=False, default=None, type='str'),
+            type    = dict(required=False, default=None, type='str')
+        )
+    )
+    host = module.ha_host()
+    
+    result = { }
+    result['changed'] = False
+    
+    # Option keys are case sensitive (both in matching and in update())
+    # Should be more efficient to build a bulk option that uses array of token strings:
+    # key:type:value => UserVars.SuppressShellWarning:long:1
+    
+    hom = host.configManager.advancedOption
+    supported = False
+    for item in hom.supportedOption:
+        if item.key == module.params['key']:
+            supported = True
+            break
+    if not supported:
+        module.fail_json(msg="unsupported option: %s" % (module.params['key']))
+    current = None
+    for item in hom.setting:
+        if item.key == module.params['key']:
+            current = item
+            break
+            
+    if 'value' in module.params and not module.params['value'] == None:
+        value = module.params['value']
+    else:
+        value = None    
+                    
+    if 'type' in module.params and not module.params['type'] == None:
+        type = module.params['type']
+        if type == 'string':
+            value = str(value)
+        elif type == 'integer':
+            value = int(value)
+        elif type == 'long':
+            value = long(value)
+        elif type == 'double':
+            value = float(value)
+
+    result['info']              = { }
+    result['info']['option']    = { }         
+    if current and current.value == value:
+        result['info']['option']['key']     = current.key
+        result['info']['option']['value']   = current.value
+        module.exit_json(**result)        
+            
+    option          = vim.option.OptionValue()
+    option.key      = module.params['key']
+    option.value    = value
+    try:
+        hom.UpdateOptions(changedValue=[option])
+    except Exception, e:
+        module.fail_json(msg="runtime fault: %s" % (e))
+    result['changed'] = True
+    
+    result['info']['option']['key']     = option.key
+    result['info']['option']['value']   = option.value
+    module.exit_json(**result)
+ 
+main()               
+            
+            
+            
